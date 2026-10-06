@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tags: no-msan, no-parallel
 # The sampling query profiler is disabled under MSan.
-# Exhaustive allocation sampling can fill the shared bounded profiler pipe, discarding other queries' samples.
+# Allocation profilers share a bounded pipe, so other tests can discard this query's samples.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -22,11 +22,12 @@ settings = {
     "send_logs_level": "none",
     "query_profiler_cpu_time_period_ns": 0,
     "query_profiler_real_time_period_ns": 0,
-    "memory_profiler_sample_probability": 1,
+    "memory_profiler_sample_probability": 0.05,
     "memory_profiler_sample_min_allocation_size": 0,
     "memory_profiler_step": 0,
     "max_untracked_memory": 0,
     "max_threads": 1,
+    "max_block_size": 8,
     "max_execution_time": 30,
     "prefer_localhost_replica": 0,
     "interactive_delay": 1000,
@@ -48,9 +49,19 @@ def native_arguments(options):
     return arguments + [f"--{key}={value}" for key, value in options.items()]
 
 
+def log_query(query):
+    # Keep small decoder allocations eligible in the profiled query; these checks do not sample themselves.
+    options = dict(settings, send_profile_traces=0, memory_profiler_sample_probability=0,
+                   max_block_size=65536, allow_introspection_functions=1)
+    result = subprocess.run(native_arguments(options) + ["--query", query],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
 query = (
     f"SELECT * FROM remote('{address}', "
-    "view(SELECT length(range(number + 100000)) FROM numbers(8))) FORMAT Null"
+    "view(SELECT arraySum(range(number + 100000)) FROM numbers(128))) FORMAT Null"
 )
 for asynchronous in (0, 1):
     for hedged in (0, 1):
@@ -70,9 +81,21 @@ for asynchronous in (0, 1):
                     continue
                 decoding = [symbol for symbol in sample["symbols"] if "Connection::receiveProfileTraces" in symbol]
                 assert not decoding, (asynchronous, hedged, sample["trace_type"], decoding)
-            if any(sample["query_id"] != query_id and any(sample["symbols"]) for sample in samples):
+            remote_samples = sum(sample["query_id"] != query_id and any(sample["symbols"]) for sample in samples)
+            log_query("SYSTEM FLUSH LOGS")
+            # `Connection::receiveProfileTraces` must still be sampled in `system.trace_log`.
+            # Numeric symbol ranges avoid demangling every frame in the allocation samples.
+            decoder_samples = int(log_query(
+                "WITH (SELECT groupArray((address_begin, address_end)) FROM system.symbols "
+                "WHERE position(symbol, 'receiveProfileTraces') > 0) AS ranges "
+                "SELECT countIf(arrayExists(address -> arrayExists(bounds -> "
+                "address >= bounds.1 AND address < bounds.2, ranges), trace)) "
+                f"FROM system.trace_log WHERE query_id = '{query_id}'"
+            ))
+            if remote_samples and decoder_samples:
                 break
         else:
-            raise AssertionError((asynchronous, hedged, "no remote samples with resolved symbols"))
+            raise AssertionError((asynchronous, hedged, "missing resolved remote samples or decoder coverage",
+                                  remote_samples, decoder_samples))
         print(f"async={asynchronous} hedged={hedged}: remote samples received without decoder feedback")
 PY
