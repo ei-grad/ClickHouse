@@ -261,6 +261,8 @@ def test_stored_ddl_profile_request(peer_name, operation):
         peer.query(f"CREATE {kind} {local_name}{engine} AS {select}", settings=SETTINGS, timeout=30)
         if operation == "alter":
             peer.query(f"CREATE {kind} {cluster_name}{engine} AS {select}", settings=SETTINGS, timeout=30)
+            # `ALTER ... ON CLUSTER` authorizes against the initiator's local view.
+            coordinator.query(f"CREATE {kind} {cluster_name}{engine} AS {select}", settings=SETTINGS, timeout=30)
             select += " WHERE x > 0"
             alter_settings = dict(SETTINGS, allow_experimental_alter_materialized_view_structure=1)
             peer.query(f"ALTER TABLE {local_name} MODIFY QUERY {select}", settings=alter_settings, timeout=30)
@@ -277,6 +279,8 @@ def test_stored_ddl_profile_request(peer_name, operation):
         assert "send_profile_traces" not in definition
         assert definition.split("AS SELECT", 1)[1] == reference.split("AS SELECT", 1)[1]
     finally:
+        if operation == "alter":
+            coordinator.query(f"DROP TABLE IF EXISTS {cluster_name} SYNC", settings=SETTINGS, timeout=30)
         peer.query(f"DROP TABLE IF EXISTS {cluster_name} SYNC; DROP TABLE IF EXISTS {local_name} SYNC", settings=SETTINGS, timeout=30)
 
 
@@ -310,12 +314,15 @@ def test_stored_alter_query_settings(index, value):
             settings=SETTINGS,
             timeout=30,
         )
+        # `ALTER ... ON CLUSTER` also needs the view on the initiating coordinator.
+        coordinator.query(f"CREATE MATERIALIZED VIEW {cluster_name} ENGINE=Memory AS SELECT x FROM default.source", settings=SETTINGS, timeout=30)
         current.query(f"ALTER TABLE {local_name} MODIFY QUERY {select}", settings=alter_settings, timeout=30)
         coordinator.query(f"ALTER TABLE {cluster_name} ON CLUSTER current_cluster MODIFY QUERY {select}", settings=alter_settings, timeout=30)
         local_select = stored_select(local_name)
         assert f"send_profile_traces = {value}" in local_select
         assert stored_select(cluster_name) == local_select
     finally:
+        coordinator.query(f"DROP TABLE IF EXISTS {cluster_name} SYNC", settings=SETTINGS, timeout=30)
         current.query(f"DROP TABLE IF EXISTS {cluster_name} SYNC; DROP TABLE IF EXISTS {local_name} SYNC", settings=SETTINGS, timeout=30)
 
 
